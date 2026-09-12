@@ -1,0 +1,37 @@
+# ===== 本机私有配置（可能含敏感信息）=====
+# 内部设计任务书与演示图（不入公开仓库）
+MISSION.md
+demo_drawing.png
+demo_gui_export.png
+# 本机配置，可能含模型 api_key（运行时自动生成，勿提交）
+config.json
+config.json.bak
+# 本机私有解释器路径
+.python-path
+
+# ===== 项目运行态数据 =====
+# WorkBuddy 项目记忆（本机私有）
+.workbuddy/
+# AI 绘画会话数据（mailbox、session.jsonl、观察帧 PNG）
+.ai-draw-session/
+# 运行产物 / 导出目录
+out/
+# finish 命令导出的成图与过程记录（若导出到仓库根目录）
+drawing-*.png
+drawing-process-*.json
+
+# ===== Python 缓存与虚拟环境 =====
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.venv/
+
+# ===== IDE =====
+.idea/
+.vscode/
+
+# ===== 其他 =====
+node_modules/
+.DS_Store
+Thumbs.db
