@@ -35,6 +35,19 @@ def check(name, cond, detail=""):
         print(f"  [FAIL] {name} {detail}", flush=True)
 
 
+def _has_timestamp(result) -> bool:
+    """工具结果里是否带 ts / elapsed_ms / duration_ms 三件套。"""
+    from datetime import datetime
+    if not isinstance(result, dict):
+        return False
+    try:
+        datetime.fromisoformat(str(result.get("ts")))
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(result.get("elapsed_ms"), int)
+            and isinstance(result.get("duration_ms"), int))
+
+
 def test_python_skill_entry():
     print("== Python Skill 入口 ==")
     from app.skill import create_skill_executor, SKILL_TOOL_NAMES
@@ -116,6 +129,9 @@ def test_stdio_bridge():
 
     r = call({"command": "ping"})
     check("桥 ping/pong", r.get("ok") is True and r.get("pong") is True)
+    check("桥 ping 带起始时间与已用时",
+          bool(r.get("started_at")) and isinstance(r.get("elapsed_ms"), int)
+          and r.get("calls") == 0, str(r))
 
     r = call({"command": "get_tools_schema"})
     names = [t["function"]["name"] for t in r.get("tools", [])]
@@ -131,6 +147,7 @@ def test_stdio_bridge():
                                                         "color": "#cc0000"}}})
     check("桥 pick_tools", r.get("id") == 10
           and r["result"].get("ok") is True)
+    r_prev = r["result"]
 
     r = call({"id": 11, "tool": "use_tool",
               "arguments": {"mode": "path", "path": {
@@ -138,6 +155,10 @@ def test_stdio_bridge():
                                                 "r": 200}}}})
     check("桥 use_tool 绘制", r["result"].get("ok") is True
           and r["result"].get("changed") is True)
+    # 每次工具调用的结果都带时间戳与用时
+    check("桥每次调用带时间戳",
+          _has_timestamp(r["result"]) and _has_timestamp(r_prev),
+          str(r["result"]))
 
     r = call({"id": 12, "tool": "get_current_picture", "arguments": {}})
     check("桥 get_current_picture(压缩到长边 ≤640)",
@@ -163,6 +184,10 @@ def test_stdio_bridge():
 
     r = call({"command": "shutdown"})
     check("桥 shutdown", r.get("bye") is True)
+    check("桥 shutdown 带总时长汇总",
+          isinstance(r.get("timing", {}).get("total_ms"), int)
+          and str(r["timing"].get("total_text", "")).endswith("秒")
+          and r["timing"].get("calls") >= 4, str(r.get("timing")))
     proc.wait(timeout=10)
     check("桥进程干净退出", proc.returncode == 0, f"rc={proc.returncode}")
 

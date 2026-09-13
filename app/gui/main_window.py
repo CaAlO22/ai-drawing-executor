@@ -19,6 +19,21 @@ from .loop_status_panel import LoopStatusPanel
 from .tool_status_panel import ToolStatusPanel
 
 
+def _format_duration(ms) -> str:
+    """毫秒 → 人话时长(与 draw_app.format_duration 同格式, 见其 docstring)。"""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return "未知"
+    h, rem = divmod(max(0, ms) / 1000.0, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 1:
+        return f"{int(h)} 小时 {int(m)} 分 {s:.0f} 秒"
+    if m >= 1:
+        return f"{int(m)} 分 {s:.1f} 秒"
+    return f"{s:.1f} 秒"
+
+
 class _EventBridge(QObject):
     """把 executor 后台线程事件桥接为 Qt 信号(自动排队到 GUI 线程)。"""
 
@@ -148,6 +163,9 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.statusBar().showMessage("Drawing Loop 运行中...")
+        # 本次运行的起点, 结束时用来汇总总时长
+        import time as _time
+        self._loop_t0 = _time.monotonic()
         self.worker.start()
 
     def stop_loop(self) -> None:
@@ -174,7 +192,22 @@ class MainWindow(QMainWindow):
         elif status == "finished":
             self.tool_panel.set_terminated("finished", reason)
         self.loop_panel.append_log(f"[loop_finished] {text}")
+        # 总时长汇总(与 replayer 的报告同口径: 人话时长)
+        self.loop_panel.append_log(f"[duration] 本次运行总时长 {self._loop_duration_text()}")
         self.statusBar().showMessage(text)
+
+    def _loop_duration_text(self) -> str:
+        """本次 Drawing Loop 的运行总时长(人话)。
+
+        格式与 draw_app.format_duration / replay 报告完全一致(同一套读法,
+        便于用户对照); 本模块属于应用包, 不反向依赖根目录的 draw_app 脚本,
+        故此处保留一份等价实现, 由测试保证两者不漂移。
+        """
+        import time as _time
+        t0 = getattr(self, "_loop_t0", None)
+        if t0 is None:
+            return "未知"
+        return _format_duration((_time.monotonic() - t0) * 1000)
 
     # ------------------------------------------------------------------
     # 导出 PNG(原始分辨率)

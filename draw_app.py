@@ -157,7 +157,11 @@ class AppDeadError(RuntimeError):
 # 会话日志: 每次工具调用逐条追加, finish 时整体导出为可重放的过程 JSON
 # --------------------------------------------------------------------------
 class SessionLog:
-    """会话日志(session.jsonl) + 过程导出(drawing-process-*.json)。"""
+    """会话日志(session.jsonl) + 过程导出(drawing-process-*.json)。
+
+    每条记录都带 ``ts``(墙钟时间戳, 毫秒精度)与 ``elapsed_ms``(距本次会话
+    第一次调用的用时), 因此事后既能还原"第几步", 也能还原"几点、隔了多久"。
+    """
 
     def __init__(self, session_dir, canvas_info: dict, options: dict = None):
         self.path = Path(session_dir) / "session.jsonl"
@@ -165,28 +169,78 @@ class SessionLog:
         # 建画布时的参数(重放按同一套参数重建, 保证与原始会话同构)
         self.options = dict(options or {})
         self.records = []
-        self._append({"seq": 0, "type": "init", "ts": _now_iso(),
+        self.started_at = _now_iso()
+        self._t0 = time.monotonic()
+        self.ended_at = None          # 结束标记(terminated)的时间戳
+        self._ended_ms = None
+        self._append({"seq": 0, "type": "init", "ts": self.started_at,
                       "schema": PROCESS_SCHEMA, "canvas": self.canvas,
                       "options": self.options})
+
+    def elapsed_ms(self) -> int:
+        """距会话开始的用时(毫秒)。"""
+        return int(max(0.0, time.monotonic() - self._t0) * 1000)
 
     def _append(self, rec: dict) -> None:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def log_call(self, tool: str, arguments: dict, result: dict) -> None:
+    def log_call(self, tool: str, arguments: dict, result: dict,
+                 duration_ms: int = None, ts: str = None,
+                 elapsed_ms: int = None) -> None:
+        """记录一次工具调用。
+
+        duration_ms: 这次调用本身耗掉的时间(毫秒, 可选)。
+        ts / elapsed_ms: 由调用方采样后传入, 保证"记录里的时间"与"同时展示
+        给模型/观察窗的时间"完全一致; 不传则在此刻现取。
+        """
         rec = {"seq": len(self.records) + 1, "type": "call",
-               "ts": _now_iso(), "tool": tool,
-               "arguments": arguments, "result": _sanitize_result(result)}
+               "ts": ts or _now_iso(),
+               "elapsed_ms": self.elapsed_ms() if elapsed_ms is None
+               else int(elapsed_ms),
+               "tool": tool, "arguments": arguments,
+               "result": _sanitize_result(result)}
+        if duration_ms is not None:
+            rec["duration_ms"] = int(duration_ms)
         self.records.append(rec)
         self._append(rec)
 
-    def log_terminated(self, status: str, text: str) -> None:
+    def log_terminated(self, status: str, text: str, ts: str = None,
+                       elapsed_ms: int = None) -> None:
+        """记录结束标记(只落 jsonl, 不进 records —— 与旧格式保持一致)。"""
+        ts = ts or _now_iso()
+        elapsed_ms = self.elapsed_ms() if elapsed_ms is None else int(elapsed_ms)
+        self.ended_at, self._ended_ms = ts, elapsed_ms
         self._append({"seq": len(self.records) + 1, "type": "terminated",
-                      "ts": _now_iso(), "status": status, "text": text})
+                      "ts": ts, "elapsed_ms": elapsed_ms,
+                      "status": status, "text": text})
+
+    def session_ms(self) -> int:
+        """本次绘画的总时长(毫秒): 以结束标记为准, 没有就用最后一条调用。"""
+        if self._ended_ms is not None:
+            return self._ended_ms
+        for rec in reversed(self.records):
+            if isinstance(rec.get("elapsed_ms"), int):
+                return rec["elapsed_ms"]
+        return self.elapsed_ms()
+
+    def timing(self) -> dict:
+        """总时长摘要(供结束工具的结果与过程 JSON 共用)。"""
+        total = self.session_ms()
+        ended = self.ended_at or (_now_iso() if not self.records
+                                 else self.records[-1].get("ts"))
+        return {"started_at": self.started_at, "ended_at": ended,
+                "total_ms": total, "total_text": format_duration(total),
+                "calls": len(self.records)}
 
     def write_process(self, out_path: Path, status: str = None,
                       text: str = None) -> None:
-        data = {"schema": PROCESS_SCHEMA, "created_at": _now_iso(),
+        timing = self.timing()
+        data = {"schema": PROCESS_SCHEMA, "created_at": self.started_at,
+                "started_at": timing["started_at"],
+                "ended_at": timing["ended_at"],
+                "duration_ms": timing["total_ms"],
+                "duration_text": timing["total_text"],
                 "canvas": self.canvas, "options": self.options,
                 "status": status, "text": text,
                 "calls": self.records}
@@ -195,6 +249,83 @@ class SessionLog:
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
+
+
+# --------------------------------------------------------------------------
+# 时间戳与时长(会话记录 / 观察窗历史行 / 重放报告共用同一套格式)
+# --------------------------------------------------------------------------
+def format_clock(ts) -> str:
+    """ISO 时间戳 → "10:10:26"(取不到有效时间戳时返回空串)。"""
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(str(ts)).strftime("%H:%M:%S")
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_offset(ms) -> str:
+    """相对用时 → "12.4s" / "1:23.4" / "1:02:03"(紧凑, 用于行首前缀)。"""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return ""
+    ms = max(0, ms)
+    if ms < 60_000:
+        return f"{ms / 1000:.1f}s"
+    h, rem = divmod(ms / 1000.0, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 1:
+        return f"{int(h)}:{int(m):02d}:{int(s):02d}"
+    return f"{int(m)}:{s:04.1f}"
+
+
+def format_duration(ms) -> str:
+    """毫秒 → 人话时长("12.4 秒" / "1 分 23.4 秒" / "1 小时 2 分 3 秒")。"""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return "未知"
+    h, rem = divmod(max(0, ms) / 1000.0, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 1:
+        return f"{int(h)} 小时 {int(m)} 分 {s:.0f} 秒"
+    if m >= 1:
+        return f"{int(m)} 分 {s:.1f} 秒"
+    return f"{s:.1f} 秒"
+
+
+def format_timeline(ts=None, elapsed_ms=None) -> str:
+    """历史行前缀: ``[10:10:26 +12.4s]``(缺哪部分省哪部分, 都没有则空串)。
+
+    绝对时间(墙钟)与相对用时(距本次会话第一次调用)一起给, 既知道"几点画的",
+    也知道"画了多久画的"。
+    """
+    clock = format_clock(ts)
+    offset = "" if elapsed_ms is None else format_offset(elapsed_ms)
+    if clock and offset:
+        return f"[{clock} +{offset}]"
+    if clock:
+        return f"[{clock}]"
+    if offset:
+        return f"[+{offset}]"
+    return ""
+
+
+def timing_summary(timing: dict) -> str:
+    """把 timing() 的汇总压成一行人话(观察窗/重放窗结束时的总时长行)。"""
+    if not isinstance(timing, dict):
+        return ""
+    total = timing.get("total_text") or format_duration(
+        timing.get("total_ms") or 0)
+    span = ""
+    started, ended = format_clock(timing.get("started_at")), format_clock(
+        timing.get("ended_at"))
+    if started and ended:
+        span = f"（{started} → {ended}）"
+    calls = timing.get("calls")
+    tail = f"，共 {calls} 次工具调用" if isinstance(calls, int) else ""
+    return f"总时长 {total}{span}{tail}"
 
 
 # --------------------------------------------------------------------------
@@ -291,12 +422,25 @@ def _fmt_settings(tool: str, state: dict) -> str:
     return "，".join(parts)
 
 
-def describe_call(tool: str, args: dict, result: dict, step_no: int):
+def describe_call(tool: str, args: dict, result: dict, step_no: int,
+                  ts: str = None, elapsed_ms: int = None):
     """把一次工具调用翻译成观察窗右栏的一行。
 
     返回 (kind, text) 或 None(不值得展示的调用)。
     kind: "action" 画布动作 / "info" 辅助操作 / "end" 结束。
+
+    给了 ts / elapsed_ms 时, 行首带上时间戳前缀 ``[10:10:26 +12.4s]``
+    (作画观察窗与重放观察窗都带; 只写文字日志的调用方可以不带)。
     """
+    entry = _describe_call_body(tool, args, result, step_no)
+    if entry is None:
+        return None
+    kind, text = entry
+    stamp = format_timeline(ts, elapsed_ms)
+    return (kind, f"{stamp} {text}" if stamp else text)
+
+
+def _describe_call_body(tool: str, args: dict, result: dict, step_no: int):
     if not isinstance(result, dict) or not result.get("ok"):
         err = (result or {}).get("error", "未知错误")
         return ("info", f"{tool_label(tool)} 执行失败：{err}")
@@ -427,8 +571,22 @@ class DrawApp:
         lines.append(f"画布：{self.canvas_info['width']} × "
                      f"{self.canvas_info['height']}")
         lines.append(f"已画：{self.step_no} 步")
+        lines.append(f"用时：{format_duration(self.log.session_ms())}")
         lines.append(f"已导出：{self.export_count} 次")
         return lines
+
+    # ---- 时间戳 ----
+    def elapsed_ms(self) -> int:
+        """本次会话已用时(毫秒), 实时值(供状态栏滴答显示)。"""
+        return self.log.elapsed_ms()
+
+    def timing_line(self) -> str:
+        return (f"开始 {format_clock(self.log.started_at)} · "
+                f"已用 {format_duration(self.elapsed_ms())}")
+
+    def _stamp(self) -> dict:
+        """当前时间戳快照(一次采样, 记录与展示共用, 保证两处时间一致)。"""
+        return {"ts": _now_iso(), "elapsed_ms": self.log.elapsed_ms()}
 
     # ---- 请求处理 ----
     def handle_request(self, obj: dict):
@@ -441,7 +599,10 @@ class DrawApp:
         if cmd == "ping":
             return {"ok": True, "pid": os.getpid(),
                     "canvas": self.canvas_info,
-                    "calls": len(self.log.records)}, False
+                    "calls": len(self.log.records),
+                    "started_at": self.log.started_at,
+                    "elapsed_ms": self.log.session_ms(),
+                    "elapsed_text": format_duration(self.log.session_ms())}, False
         tool = obj.get("tool")
         if not tool:
             return {"ok": False, "error": "Missing 'tool' or 'command'."}, False
@@ -453,24 +614,42 @@ class DrawApp:
             # 不接受原图请求 —— 这是节约模型上下文的关键约束。
             args = dict(args)
             args["full_resolution"] = False
+        t_call = time.monotonic()
         result = self.executor.call_tool(tool, args)
-        self.log.log_call(tool, args, result)
+        call_ms = int((time.monotonic() - t_call) * 1000)
+        # 时间戳一次采样: 记录、结果、观察窗右栏三处用同一个时刻
+        stamp = self._stamp()
+        self.log.log_call(tool, args, result, duration_ms=call_ms,
+                          ts=stamp["ts"], elapsed_ms=stamp["elapsed_ms"])
         # 右栏历史记录: 每步画布动作计数一次, 辅助操作只记为提示行
         if isinstance(result, dict) and result.get("ok") and result.get(
                 "changed") and tool == "use_tool":
             self.step_no += 1
-        entry = describe_call(tool, args, result, self.step_no)
+        entry = describe_call(tool, args, result, self.step_no,
+                              ts=stamp["ts"], elapsed_ms=stamp["elapsed_ms"])
         if entry:
             self.history_entries.append(entry)
             self.panels_revision += 1
         if tool in ("finish", "itsHardToFinish") and result.get("ok"):
             status = "finished" if tool == "finish" else "aborted"
             text = result.get("summary") or result.get("reason") or ""
-            self.log.log_terminated(status, text)
+            self.log.log_terminated(status, text, ts=stamp["ts"],
+                                    elapsed_ms=stamp["elapsed_ms"])
+            timing = self.log.timing()
+            result["timing"] = timing
             try:
                 result["exported"] = self.export_outputs(status, text)
             except Exception as e:  # 导出失败不影响工具结果本身
                 result["export_error"] = str(e)
+            # 右栏末尾再补一行总时长汇总(结束行仍是结论, 汇总跟在后面)
+            self.history_entries.append(("info", timing_summary(timing)))
+            self.panels_revision += 1
+        # 每次调用的结果都带上时间戳与本步耗时, 让模型自己也能看到节奏
+        if isinstance(result, dict):
+            result["ts"] = stamp["ts"]
+            result["elapsed_ms"] = stamp["elapsed_ms"]
+            result["elapsed_text"] = format_duration(stamp["elapsed_ms"])
+            result["duration_ms"] = call_ms
         return {"ok": True, "result": result}, False
 
     def export_outputs(self, status: str, text: str) -> dict:
@@ -484,7 +663,8 @@ class DrawApp:
         img.save(png_path, format="PNG")
         proc_path = self.export_dir / f"drawing-process-{stamp}{suffix}.json"
         self.log.write_process(proc_path, status=status, text=text)
-        return {"image": str(png_path), "process": str(proc_path)}
+        return {"image": str(png_path), "process": str(proc_path),
+                "timing": self.log.timing()}
 
     # ---- 主循环 tick(由 GUI 定时器或无头循环驱动) ----
     def tick(self) -> bool:
@@ -544,7 +724,7 @@ class DrawApp:
         return buf.getvalue()
 
     def _tool_html(self) -> str:
-        """左栏 HTML: 当前工具 + 设置。"""
+        """左栏 HTML: 当前工具 + 设置 + 画布/步数/用时。"""
         state = self.current_tool_state()
         tool = state.get("tool", "?")
         detail = _fmt_settings(tool, state) or "（该工具无可调参数）"
@@ -554,6 +734,7 @@ class DrawApp:
                 f"<span style='color:#6b7280'>画布 "
                 f"{self.canvas_info['width']} × {self.canvas_info['height']}"
                 f"<br>已画 {self.step_no} 步"
+                f"<br>用时 {format_duration(self.log.session_ms())}"
                 f"<br>已导出 {self.export_count} 次</span>")
 
     def _history_html(self) -> str:
@@ -577,19 +758,30 @@ class DrawApp:
         return "".join(out)
 
     @staticmethod
-    def _make_qt_window():
+    def _make_qt_window(close_hides: bool = True):
         """构建观察窗: 左=当前工具 / 中=画布 / 右=历史记录(自然语言)。
 
-        用子类拦截 closeEvent(关窗只隐藏, 不退出)。
+        close_hides=True(作画观察窗): 用子类拦截 closeEvent, 关窗只隐藏,
+        后台继续作画。
+        close_hides=False(重放观察窗): 关窗即真关闭并退出事件循环 —— 重放
+        的语义是"窗口关闭即结束", 若沿用"只隐藏"会让事件循环永不返回,
+        进程挂住、最终 PNG 与重放报告都出不来。
         """
         from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMainWindow,
-                                       QTextBrowser, QVBoxLayout, QWidget)
+        from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel,
+                                       QMainWindow, QTextBrowser,
+                                       QVBoxLayout, QWidget)
 
         class _ViewerWindow(QMainWindow):
             def closeEvent(self, ev):
-                self.hide()
-                ev.ignore()
+                if close_hides:
+                    self.hide()
+                    ev.ignore()
+                    return
+                ev.accept()
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
 
         win = _ViewerWindow()
         win.setWindowTitle("AI 绘画 · 模型作画中（只读）")
@@ -598,8 +790,11 @@ class DrawApp:
         outer = QVBoxLayout(central)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
-        hint = QLabel("用户旁观窗口：画面完全由模型的工具调用产生，本窗口不可绘画。"
-                      "关闭窗口不影响后台作画。")
+        hint_text = ("用户旁观窗口：画面完全由模型的工具调用产生，本窗口不可绘画。"
+                     "关闭窗口不影响后台作画。" if close_hides else
+                     "重放观察窗口：画面按原始记录逐笔重放，本窗口不可绘画。"
+                     "关闭窗口即结束。")
+        hint = QLabel(hint_text)
         hint.setStyleSheet("color:#6b7280;font-size:11px;")
         outer.addWidget(hint)
 
@@ -700,6 +895,8 @@ class DrawApp:
             refresh_panels()
             win.statusBar().showMessage(
                 f"{self.status_text} · 已画 {self.step_no} 步 · "
+                f"用时 {format_duration(self.elapsed_ms())} · "
+                f"开始 {format_clock(self.log.started_at)} · "
                 f"已导出 {self.export_count} 次 · 只读观察")
 
         timer = QTimer()
@@ -801,7 +998,11 @@ class DrawApp:
                         repaint()
                     refresh_panels()
                     status.config(text=f"{self.status_text} · 已画 "
-                                       f"{self.step_no} 步 · 已导出 "
+                                       f"{self.step_no} 步 · 用时 "
+                                       f"{format_duration(self.elapsed_ms())}"
+                                       f" · 开始 "
+                                       f"{format_clock(self.log.started_at)}"
+                                       f" · 已导出 "
                                        f"{self.export_count} 次 · 只读观察")
                     root.after(40, loop)
                 except tk.TclError:

@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """右侧状态框: Loop Log(按时间日志) + Current Context(真实上下文摘要)。
 
+- 每条日志都带 [HH:MM:SS] 时间戳(与观察窗/replay 的时间戳同一读法);
 - 图片一律用 [canvas image] 占位符, 不直接塞进状态框。
 - 明确区分模型主动输出与应用自动返回的画布图片。
 """
+from datetime import datetime
+
 from PySide6.QtWidgets import (QPlainTextEdit, QTabWidget, QVBoxLayout,
                                QWidget)
 
@@ -34,7 +37,8 @@ class LoopStatusPanel(QWidget):
 
     # ------------------------------------------------------------------
     def append_log(self, text: str) -> None:
-        self.log_edit.appendPlainText(text)
+        """每条日志行首加墙钟时间戳(只加一次, 多行正文照旧)。"""
+        self.log_edit.appendPlainText(f"[{datetime.now():%H:%M:%S}] {text}")
 
     def append_assistant(self, text: str) -> None:
         self.append_log(f"[assistant]\n{text}")

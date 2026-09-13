@@ -11,6 +11,9 @@ skill 包。脚本用 `__file__` 定位自身所在目录并把它加入 sys.pat
        {"id": <any>, "tool": <name>, "arguments": {...}}
   响应  {"ok": true, ...}  或  {"ok": false, "error": "..."}
   工具调用响应: {"id": <any>, "ok": true, "result": {...}}
+  每次工具调用的 result 里都带时间戳: ts(墙钟, 毫秒精度) /
+  elapsed_ms(距本次桥启动的用时) / duration_ms(本次调用耗时);
+  ping 与 shutdown 的响应里另有 elapsed_ms / timing 时长汇总。
 
 桥进程只提供工具, 不管理模型上下文, 不调用模型(MISSION 第 16 节)。
 init 的 observe_max_side(默认 640)决定返回给模型的观察图最长边:
@@ -27,6 +30,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # 把脚本所在目录(即项目根)加入 sys.path, 以便 import 同目录的 app 包。
@@ -51,6 +55,9 @@ except ImportError as _e:  # 缺第三方依赖时给出可操作的提示
     }, ensure_ascii=False), flush=True)
     raise SystemExit(1)
 
+# 时间戳/时长格式与会话日志(draw_app)完全一致(本模块只依赖标准库)
+from draw_app import format_duration  # noqa: E402
+
 DEFAULTS = {
     "width": 1920,
     "height": 1080,
@@ -58,6 +65,39 @@ DEFAULTS = {
     "max_history_steps": 100,
     "observe_max_side": 640,
 }
+
+
+def _iso() -> str:
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+class Clock:
+    """桥模式的时间戳: 每次工具调用的响应里带上时间与用时。
+
+    桥不落盘会话日志(它只提供工具), 因此时间信息随响应返回; shutdown 时
+    再给一份总时长汇总。
+    """
+
+    def __init__(self):
+        self.started_at = _iso()
+        self._t0 = time.monotonic()
+        self.calls = 0
+
+    def elapsed_ms(self) -> int:
+        return int(max(0.0, time.monotonic() - self._t0) * 1000)
+
+    def stamp(self, duration_ms: int = None) -> dict:
+        self.calls += 1
+        out = {"ts": _iso(), "elapsed_ms": self.elapsed_ms()}
+        if duration_ms is not None:
+            out["duration_ms"] = int(duration_ms)
+        return out
+
+    def timing(self) -> dict:
+        total = self.elapsed_ms()
+        return {"started_at": self.started_at, "ended_at": _iso(),
+                "total_ms": total, "total_text": format_duration(total),
+                "calls": self.calls}
 
 
 class FrameWatcher:
@@ -132,6 +172,7 @@ def main(argv=None) -> int:
                            args.watch_interval)
     executor = _make_executor(DEFAULTS, watcher)
     watcher.flush(executor.engine, force=True)
+    clock = Clock()
 
     for line in sys.stdin:
         line = line.strip()
@@ -149,10 +190,12 @@ def main(argv=None) -> int:
         cmd = req.get("command")
         if cmd == "shutdown":
             watcher.flush(executor.engine, force=True)
-            _write({"ok": True, "bye": True})
+            _write({"ok": True, "bye": True, "timing": clock.timing()})
             return 0
         elif cmd == "ping":
-            _write({"ok": True, "pong": True})
+            _write({"ok": True, "pong": True, "started_at": clock.started_at,
+                    "elapsed_ms": clock.elapsed_ms(),
+                    "calls": clock.calls})
             continue
         elif cmd == "get_tools_schema":
             # 外部 Skill 模式工具集(含 get_current_picture)
@@ -176,7 +219,12 @@ def main(argv=None) -> int:
             _write({"ok": False,
                     "error": "Request must contain 'command' or 'tool'."})
             continue
+        t_call = time.monotonic()
         result = executor.call_tool(str(tool), req.get("arguments") or {})
+        call_ms = int((time.monotonic() - t_call) * 1000)
+        # 每次工具调用的结果都带时间戳(墙钟)与用时, 便于事后统计节奏
+        if isinstance(result, dict):
+            result.update(clock.stamp(duration_ms=call_ms))
         _write({"id": req.get("id"), "ok": True, "result": result})
         watcher.flush(executor.engine)  # 响应后补一帧(节流)
 

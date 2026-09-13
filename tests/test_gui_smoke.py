@@ -57,6 +57,33 @@ def test_gui_smoke():
     check("画布视图存在", win.canvas_view is not None)
     check("Loop 状态面板存在", win.loop_panel is not None)
 
+    # Loop Log 时间戳与总时长(与观察窗/replay 同一套读法)
+    import re
+    import time as _time
+
+    from draw_app import format_duration
+    from app.gui.main_window import _format_duration
+    win.loop_panel.clear_log()
+    win.loop_panel.append_round(1)
+    win.loop_panel.append_tool_call("use_tool", '{"mode": "point"}')
+    log_text = win.loop_panel.log_edit.toPlainText()
+    check("Loop Log 每行带墙钟时间戳",
+          bool(re.search(r"^\[\d{2}:\d{2}:\d{2}\] ===== Round 1 =====", log_text,
+                         re.M))
+          and bool(re.search(r"^\[\d{2}:\d{2}:\d{2}\] \[tool_call\]", log_text,
+                             re.M)), log_text.replace("\n", " | "))
+    check("时长格式与 draw_app 一致(防两处漂移)",
+          all(_format_duration(x) == format_duration(x)
+              for x in (0, 12400, 83200, 3723000, None)),
+          f"{_format_duration(83200)} vs {format_duration(83200)}")
+    win._loop_t0 = _time.monotonic() - 1.25
+    win.on_loop_finished("finished", "测试完成。")
+    tail = win.loop_panel.log_edit.toPlainText().strip().splitlines()[-1]
+    check("Loop 结束时汇总总时长",
+          re.match(r"^\[\d{2}:\d{2}:\d{2}\] \[duration\] 本次运行总时长 "
+                   r"1\.[0-9] 秒$", tail), tail)
+    win.loop_panel.clear_log()
+
     # 事件桥接
     win._bridge.tool_selected.emit("brush")
     check("tool_selected 桥接", True)
@@ -147,6 +174,8 @@ def test_gui_smoke():
                        "options": {"max_history_steps": 100},
                        "calls": [
                            {"type": "call", "seq": 1, "tool": "pick_tools",
+                            "ts": "2026-09-13T10:10:26.000",
+                            "elapsed_ms": 0,
                             "arguments": {"tool": "pen",
                                           "settings": {"color": "#ff0000",
                                                        "size": 4}},
@@ -155,6 +184,8 @@ def test_gui_smoke():
                                                         "color": "#ff0000",
                                                         "size": 4}}},
                            {"type": "call", "seq": 2, "tool": "use_tool",
+                            "ts": "2026-09-13T10:10:28.500",
+                            "elapsed_ms": 2500,
                             "arguments": {"mode": "path", "closed": False,
                                           "path": {"points": [
                                               [100, 100], [200, 200],
@@ -174,7 +205,8 @@ def test_gui_smoke():
         def on_call(rec, result, step_no):
             desc = result if result is not None else (rec.get("result") or {})
             entry = describe_call(rec.get("tool"), rec.get("arguments") or {},
-                                  desc, step_no)
+                                  desc, step_no, ts=rec.get("ts"),
+                                  elapsed_ms=rec.get("elapsed_ms"))
             if entry:
                 panel["entries"].append(entry)
             ex = box.get("executor")
@@ -188,22 +220,37 @@ def test_gui_smoke():
                            on_executor=on_executor)
             box["stats"] = st
             panel["entries"].append(("end", "重放完成：共重放 2 次调用"))
+            panel["timing_lines"] = ["记录时间：[10:10:28 +2.5s]",
+                                     "重放用时：0.4 秒"]
             panel["revision"] += 1
 
         wt = threading.Thread(target=_worker, daemon=True)
         wt.start()
         wt.join(timeout=30)
         check("重放 worker 完成", box.get("stats") is not None)
+        check("重放统计含时长(记录时长 + 重放用时)",
+              box["stats"].get("recorded_ms") == 2500
+              and isinstance(box["stats"].get("replay_ms"), int)
+              and isinstance(box["stats"].get("pure_ms"), int))
         check("面板步数统计", panel["step_no"] == 1)
         check("面板历史行完整",
               [k for k, _ in panel["entries"]] ==
               ["info", "action", "end"])
+        check("历史行带记录时间戳",
+              panel["entries"][0][1].startswith("[10:10:26 +0.0s]")
+              and panel["entries"][1][1].startswith("[10:10:28 +2.5s]"),
+              panel["entries"])
         viewer = ReplayViewer(frame_path, panel, interval_ms=30)
         viewer._tick_qt()
         check("左栏渲染当前工具", "硬笔" in viewer._tool_view.text())
+        check("左栏渲染时间信息",
+              "重放用时" in viewer._tool_view.text()
+              and "记录时间" in viewer._tool_view.text())
         doc = viewer._history_view.toPlainText()
         check("右栏渲染历史记录",
               "选好工具" in doc and "第 1 步" in doc and "重放完成" in doc)
+        check("右栏历史行带时间戳", "[10:10:26 +0.0s]" in doc
+              and "[10:10:28 +2.5s]" in doc, doc)
         check("中栏渲染画布帧",
               viewer._canvas.pixmap() is not None
               and not viewer._canvas.pixmap().isNull())

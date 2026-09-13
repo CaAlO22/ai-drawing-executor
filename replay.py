@@ -20,6 +20,8 @@
 - --watch 时打开三栏重放观察窗(左=当前工具 / 中=画布 / 右=历史记录,
   布局与作画观察窗一致, 自动选 Qt/tk 后端), 窗口关闭即结束。
 - 重放结束后输出最终 PNG(默认与过程 JSON 同目录, 文件名加 replay- 前缀)。
+- 每条历史行都带时间戳(原始记录里的墙钟时间 + 距第一次调用的用时),
+  末尾汇总"记录时长(原始会话画了多久)"与"重放用时(这次重放跑了多久)"。
 """
 import argparse
 import json
@@ -28,7 +30,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from draw_app import PROCESS_SCHEMA  # noqa: E402
+from draw_app import (PROCESS_SCHEMA, format_clock,  # noqa: E402
+                      format_duration, format_timeline)
 
 # 纯观察类工具: 不改变画布, 重放无意义(get_canvas_info 会照常重放, 无害)
 SKIP_TOOLS = {"get_current_picture"}
@@ -53,6 +56,40 @@ def _signature(result) -> dict:
     if not isinstance(result, dict):
         return {}
     return {k: result.get(k) for k in _COMPARE_KEYS if k in result}
+
+
+def _diff_ms(a, b):
+    """两个 ISO 时间戳之间相差多少毫秒(解析失败返回 None)。"""
+    from datetime import datetime
+    try:
+        return int((datetime.fromisoformat(str(b))
+                    - datetime.fromisoformat(str(a))).total_seconds() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recorded_span(data: dict):
+    """从过程记录推算 (started_at, ended_at, 总时长毫秒)。
+
+    新版本导出的过程 JSON 自带 ``duration_ms`` / ``started_at`` / ``ended_at``,
+    直接采用; 旧文件(或测试构造的最小记录)没有这些字段, 就从各条记录的
+    ``ts`` / ``elapsed_ms`` 推算; 什么都取不到时返回 (None, None, None)。
+    """
+    calls = [r for r in (data.get("calls") or []) if isinstance(r, dict)]
+    started = data.get("started_at")
+    ended = data.get("ended_at")
+    stamps = [r.get("ts") for r in calls if r.get("ts")]
+    started = started or (stamps[0] if stamps else None)
+    ended = ended or (stamps[-1] if stamps else None)
+    total = data.get("duration_ms")
+    if total is None:
+        offsets = [r.get("elapsed_ms") for r in calls
+                   if isinstance(r.get("elapsed_ms"), int)]
+        if offsets:
+            total = offsets[-1]
+        elif started and ended:
+            total = _diff_ms(started, ended)
+    return started, ended, total
 
 
 def write_blank_frame(canvas: dict, frame_path: Path) -> None:
@@ -82,6 +119,10 @@ def replay(data: dict, on_frame=None, step_seconds: float = 0.0,
     None), 用于逐条打印 --verbose 轨迹。
     on_executor(executor): executor 创建完成后立即回调(在第一次任何调用
     之前), 供 --watch 的帧回调提前拿到 executor 引用。
+
+    统计信息里含时间维度: ``started_at`` / ``ended_at`` / ``recorded_ms``
+    (原始会话画了多久, 取自过程记录)与 ``replay_ms`` / ``pure_ms``
+    (本次重放的墙钟用时与纯执行用时)。
     """
     from app.skill import create_skill_executor
 
@@ -93,9 +134,13 @@ def replay(data: dict, on_frame=None, step_seconds: float = 0.0,
         max_history_steps=int(options.get("max_history_steps", 100)))
     if on_executor is not None:
         on_executor(executor)
+    started_at, ended_at, recorded_ms = _recorded_span(data)
     stats = {"total": 0, "executed": 0, "skipped": 0, "undo_redo": 0,
              "failed_recorded": 0, "failed": 0, "mismatched": [],
-             "status": None, "text": None, "errors": []}
+             "status": None, "text": None, "errors": [],
+             "started_at": started_at, "ended_at": ended_at,
+             "recorded_ms": recorded_ms, "replay_ms": 0, "pure_ms": 0}
+    t_replay = time.monotonic()
     step_no = 0
     for rec in data.get("calls", []):
         if rec.get("type") != "call":
@@ -118,10 +163,12 @@ def replay(data: dict, on_frame=None, step_seconds: float = 0.0,
         stats["executed"] += 1
         if tool in UNDO_REDO_TOOLS:
             stats["undo_redo"] += 1
+        t_call = time.monotonic()
         try:
             result = executor.call_tool(tool, args)
         except Exception as e:  # call_tool 本身不抛, 这里只是兜底
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        stats["pure_ms"] += int((time.monotonic() - t_call) * 1000)
         if not isinstance(result, dict):
             result = {}
         if not result.get("ok"):
@@ -143,6 +190,7 @@ def replay(data: dict, on_frame=None, step_seconds: float = 0.0,
         if on_frame is not None and step_seconds > 0:
             on_frame()
             time.sleep(step_seconds)
+    stats["replay_ms"] = int((time.monotonic() - t_replay) * 1000)
     if data.get("status"):
         stats["status"] = data["status"]
     if data.get("text"):
@@ -151,27 +199,53 @@ def replay(data: dict, on_frame=None, step_seconds: float = 0.0,
 
 
 def _make_tracer():
-    """--verbose: 每步用观察窗同一套自然语言映射打印一行。"""
+    """--verbose: 每步用观察窗同一套自然语言映射打印一行(带时间戳)。"""
     from draw_app import describe_call
 
     def on_call(rec, result, step_no):
         tool = rec.get("tool")
+        stamp = {"ts": rec.get("ts"), "elapsed_ms": rec.get("elapsed_ms")}
         if result is None:
             # 跳过重放的纯观察调用: 也打印出来, 保持轨迹完整
             entry = describe_call(tool, rec.get("arguments") or {},
-                                  rec.get("result") or {}, step_no)
+                                  rec.get("result") or {}, step_no, **stamp)
             if entry is not None:
                 print(f"· [{rec.get('seq')}] {entry[1]}（纯观察, 跳过重放）",
                       flush=True)
             return
-        entry = describe_call(tool, rec.get("arguments") or {},
-                              result, step_no)
+        entry = describe_call(tool, rec.get("arguments") or {}, result,
+                              step_no, **stamp)
         if entry is None:
             return
         kind, text = entry
         mark = {"action": "  ", "info": "· ", "end": "■ "}.get(kind, "  ")
         print(f"{mark}[{rec.get('seq')}] {text}", flush=True)
     return on_call
+
+
+def _timing_lines(rec: dict, replay_seconds: float = None) -> list:
+    """左栏的"时间"两行: 当前这一步的记录时间 + 重放已用时。"""
+    lines = []
+    stamp = format_timeline(rec.get("ts"), rec.get("elapsed_ms"))
+    if stamp:
+        lines.append(f"记录时间：{stamp}")
+    if replay_seconds is not None:
+        lines.append(f"重放用时：{format_duration(replay_seconds * 1000)}")
+    return lines
+
+
+def _duration_summary(stats: dict) -> str:
+    """一句话时长汇总(记录时长 + 重放用时)。"""
+    parts = []
+    if stats.get("recorded_ms") is not None:
+        span = ""
+        if stats.get("started_at") and stats.get("ended_at"):
+            span = (f"（{format_clock(stats['started_at'])} → "
+                    f"{format_clock(stats['ended_at'])}）")
+        parts.append(f"记录时长 {format_duration(stats['recorded_ms'])}{span}")
+    if stats.get("replay_ms") is not None:
+        parts.append(f"重放用时 {format_duration(stats['replay_ms'])}")
+    return "；".join(parts)
 
 
 def main(argv=None) -> int:
@@ -218,7 +292,8 @@ def main(argv=None) -> int:
         write_blank_frame(data.get("canvas") or {}, frame_path)
         # 三栏面板数据(worker 线程写快照, GUI 主线程读), 布局与观察窗一致
         panel = {"entries": [], "tool_state": None, "step_no": 0,
-                 "canvas_info": data.get("canvas") or {}, "revision": 0}
+                 "canvas_info": data.get("canvas") or {}, "revision": 0,
+                 "timing_lines": _timing_lines({}, replay_seconds=0.0)}
         box = {"done": False}
         try:
             viewer = ReplayViewer(frame_path, panel,
@@ -226,17 +301,20 @@ def main(argv=None) -> int:
         except RuntimeError as e:
             print(e, file=sys.stderr)
             return 2
+        t_start = time.monotonic()
 
         def on_call(rec, result, step_no):
             if tracer is not None:
                 tracer(rec, result, step_no)
-            # 右栏历史: 与观察窗同一套自然语言映射; 跳过的观察调用
-            # 用记录里的原始结果描述, 保持轨迹完整
+            # 右栏历史: 与观察窗同一套自然语言映射(带记录时间戳);
+            # 跳过的观察调用用记录里的原始结果描述, 保持轨迹完整
             desc_result = result if result is not None else (
                 rec.get("result") or {})
             entry = describe_call(rec.get("tool"),
                                   rec.get("arguments") or {},
-                                  desc_result, step_no)
+                                  desc_result, step_no,
+                                  ts=rec.get("ts"),
+                                  elapsed_ms=rec.get("elapsed_ms"))
             if entry:
                 panel["entries"].append(entry)
             # 左栏当前工具快照(executor 只在 worker 线程访问)
@@ -246,10 +324,15 @@ def main(argv=None) -> int:
                     panel["tool_state"] = ex.current_tool_state()
                 except Exception:
                     pass
+            panel["timing_lines"] = _timing_lines(
+                rec, replay_seconds=time.monotonic() - t_start)
+            if rec.get("ts"):
+                panel["last_ts"] = rec["ts"]
             panel["step_no"] = step_no
             panel["revision"] += 1
 
         def worker():
+            stats = None
             try:
                 def frame_cb():
                     img = box["executor"].engine.observation_image(
@@ -275,13 +358,22 @@ def main(argv=None) -> int:
                     step_seconds=args.step_ms / 1000, on_call=on_call,
                     on_executor=on_executor)
                 box["stats"] = stats
+                summary = _duration_summary(stats)
                 tail = (f"重放完成：共重放 {stats['total']} 次调用"
                         + (f"（{len(stats['mismatched'])} 次与原始记录不一致）"
                            if stats["mismatched"] else "，全部与原始记录一致"))
             except Exception as e:  # noqa: BLE001
                 box["error"] = e
+                summary = ""
                 tail = f"重放失败：{e}"
             panel["entries"].append(("end", tail))
+            if summary:
+                # 时长汇总单独一行(info 样式): 两个 GUI 后端都能正确换行显示
+                panel["entries"].append(("info", summary))
+            panel["timing_lines"] = _timing_lines(
+                {"ts": panel.get("last_ts"),
+                 "elapsed_ms": stats.get("recorded_ms") if stats else None},
+                replay_seconds=time.monotonic() - t_start)
             panel["revision"] += 1
             box["done"] = True
 
@@ -322,6 +414,22 @@ def _report(stats: dict, out_path: Path) -> None:
              f"记录中的失败调用 {stats['failed_recorded']} 次(按原样重放)"]
     if stats["failed"]:
         lines.append(f"  重放时再次失败 {stats['failed']} 次(与原始记录一致)")
+    # 时长汇总: 记录时长(原会话画了多久) + 重放用时(这次跑完用了多久)
+    if stats.get("recorded_ms") is not None:
+        span = ""
+        if stats.get("started_at") and stats.get("ended_at"):
+            span = (f"（{format_clock(stats['started_at'])} → "
+                    f"{format_clock(stats['ended_at'])}）")
+        lines.append(f"  记录时长 {format_duration(stats['recorded_ms'])}{span}")
+    if stats.get("replay_ms") is not None:
+        extra = ""
+        if stats.get("pure_ms") is not None:
+            extra = f"（纯执行 {format_duration(stats['pure_ms'])}"
+            if stats["executed"] > 0:
+                extra += (f"，平均每次 "
+                          f"{format_duration(stats['pure_ms'] / stats['executed'])}")
+            extra += "）"
+        lines.append(f"  重放用时 {format_duration(stats['replay_ms'])}{extra}")
     if stats["mismatched"]:
         lines.append(f"  [!] {len(stats['mismatched'])} 次调用的结果与原始记录"
                      f"不一致 —— 重放未能忠实还原:")

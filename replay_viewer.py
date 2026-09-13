@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """重放观察窗口: 边重放边旁观, 布局与作画观察窗一致的三栏视图。
 
-左 = 当前工具(中文名 + 设置 + 画布/步数)
+左 = 当前工具(中文名 + 设置 + 画布/步数/时间)
 中 = 只读画布(轮询帧 PNG)
-右 = 历史记录(每次工具调用映射为自然语言, describe_call)
+右 = 历史记录(每次工具调用映射为自然语言, 每行带记录时间戳)
+
+左侧还会显示当前这一步的记录时间与本次重放的已用时长; 重放结束后右栏末尾
+汇总记录时长(原会话画了多久)与重放用时(这次重放跑了多久)。
 
 数据流: 重放 worker 线程只往共享 panel dict 里写快照(工具状态、历史行、
 步数、版本号), GUI 定时器在**主线程**读快照刷新 —— 跨线程只传数据,
@@ -55,7 +58,7 @@ class ReplayViewer:
     # 面板内容(纯函数, 与 draw_app 观察窗同一套文案)
     # ------------------------------------------------------------------
     @staticmethod
-    def _tool_lines(tool_state, canvas_info, step_no) -> list:
+    def _tool_lines(tool_state, canvas_info, step_no, timing_lines=None) -> list:
         from draw_app import _fmt_settings, tool_label
         state = tool_state or {}
         tool = state.get("tool", "?")
@@ -66,15 +69,18 @@ class ReplayViewer:
         lines.append(f"画布：{canvas_info.get('width', '?')} × "
                      f"{canvas_info.get('height', '?')}")
         lines.append(f"已画：{step_no} 步")
+        lines.extend(timing_lines or [])
         return lines
 
     @staticmethod
-    def _tool_html(tool_state, canvas_info, step_no) -> str:
+    def _tool_html(tool_state, canvas_info, step_no, timing_lines=None) -> str:
         from draw_app import _fmt_settings, tool_label
         state = tool_state or {}
         tool = state.get("tool", "?")
         detail = _fmt_settings(tool, state) or "（该工具无可调参数）"
         detail = _html.escape(detail)
+        timing = "<br>".join(_html.escape(t) for t in (timing_lines or []))
+        timing = f"<br>{timing}" if timing else ""
         return (f"<b>{_html.escape(tool_label(tool))}</b> "
                 f"<span style='color:#6b7280'>({_html.escape(tool)})</span>"
                 f"<br><br>"
@@ -82,7 +88,7 @@ class ReplayViewer:
                 f"<span style='color:#6b7280'>画布 "
                 f"{canvas_info.get('width', '?')} × "
                 f"{canvas_info.get('height', '?')}"
-                f"<br>已画 {step_no} 步</span>")
+                f"<br>已画 {step_no} 步{timing}</span>")
 
     @staticmethod
     def _history_html(entries) -> str:
@@ -114,7 +120,9 @@ class ReplayViewer:
         self._Qt, self._QPixmap = Qt, QPixmap
         self._qapp = QApplication.instance() or QApplication(["replay"])
         self._win, self._canvas, self._tool_view, self._history_view = (
-            DrawApp._make_qt_window())
+            # 重放窗: 关窗即结束(close_hides=False) —— 与作画观察窗不同,
+            # 作画时关窗不能停画, 重放时关窗必须让事件循环返回
+            DrawApp._make_qt_window(close_hides=False))
         self._win.setWindowTitle("AI 绘画 · 过程重放（只读）")
         self._win.setStatusBar(QStatusBar())
         self._timer = QTimer()
@@ -180,13 +188,17 @@ class ReplayViewer:
         self._tool_view.setText(self._tool_html(
             self._panel.get("tool_state"),
             self._panel.get("canvas_info") or {},
-            self._panel.get("step_no", 0)))
+            self._panel.get("step_no", 0),
+            self._panel.get("timing_lines")))
         self._history_view.setHtml(
             "<div style='font-family:system-ui,Segoe UI;font-size:12px'>"
             + self._history_html(list(self._panel.get("entries") or []))
             + "</div>")
         bar = self._history_view.verticalScrollBar()
         bar.setValue(bar.maximum())   # 自动滚到最新一条
+        timing = [t for t in (self._panel.get("timing_lines") or []) if t]
+        if timing and self._win.statusBar() is not None:
+            self._win.statusBar().showMessage(" · ".join(timing) + " · 只读重放")
 
     # ------------------------------------------------------------------
     # 后端 2: tkinter(标准库兜底)
@@ -307,7 +319,8 @@ class ReplayViewer:
         self._tool_text.config(text="\n".join(self._tool_lines(
             self._panel.get("tool_state"),
             self._panel.get("canvas_info") or {},
-            self._panel.get("step_no", 0))))
+            self._panel.get("step_no", 0),
+            self._panel.get("timing_lines"))))
         self._history.config(state="normal")
         self._history.delete("1.0", "end")
         entries = list(self._panel.get("entries") or [])
@@ -317,6 +330,9 @@ class ReplayViewer:
             self._history.insert("end", text + "\n\n", kind)
         self._history.config(state="disabled")
         self._history.see("end")
+        timing = [t for t in (self._panel.get("timing_lines") or []) if t]
+        if timing:
+            self._status.config(text=" · ".join(timing) + " · 只读重放")
 
     # ------------------------------------------------------------------
     # 统一入口

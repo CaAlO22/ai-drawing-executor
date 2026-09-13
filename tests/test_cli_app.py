@@ -45,6 +45,56 @@ class TestSanitize(unittest.TestCase):
         self.assertEqual(_sanitize_result([1, 2]), [1, 2])
 
 
+class TestTimeFormatting(unittest.TestCase):
+    """时间戳/时长的格式与历史行前缀(观察窗与重放共用同一套)。"""
+
+    def test_clock_offset_duration(self):
+        from draw_app import (format_clock, format_duration,
+                              format_offset, format_timeline)
+        self.assertEqual(format_clock("2026-09-13T10:10:26.123"), "10:10:26")
+        self.assertEqual(format_clock(""), "")
+        self.assertEqual(format_clock("不是时间戳"), "")
+        self.assertEqual(format_offset(0), "0.0s")
+        self.assertEqual(format_offset(12400), "12.4s")
+        self.assertEqual(format_offset(83200), "1:23.2")     # 分:秒.十分位
+        self.assertEqual(format_offset(3723000), "1:02:03")  # 时:分:秒
+        self.assertEqual(format_duration(12400), "12.4 秒")
+        self.assertEqual(format_duration(83200), "1 分 23.2 秒")
+        self.assertEqual(format_duration(3723000), "1 小时 2 分 3 秒")
+        self.assertEqual(format_duration(None), "未知")
+        self.assertEqual(format_timeline("2026-09-13T10:10:26.123", 12400),
+                         "[10:10:26 +12.4s]")
+        # 缺哪部分省哪部分, 全缺为空串(旧记录没有时间戳时不留痕迹)
+        self.assertEqual(format_timeline(None, None), "")
+        self.assertEqual(format_timeline("2026-09-13T10:10:26.123", None),
+                         "[10:10:26]")
+        self.assertEqual(format_timeline(None, 5000), "[+5.0s]")
+
+    def test_describe_call_prefixes_timestamp(self):
+        from draw_app import describe_call
+        res = {"ok": True, "changed": True, "action": "draw",
+               "current_tool": {"tool": "pen", "color": "#3366cc"}}
+        entry = describe_call(
+            "use_tool", {"mode": "path",
+                         "path": {"points": [[100, 100], [900, 900]]}},
+            res, 1, ts="2026-09-13T10:10:26.123", elapsed_ms=12400)
+        self.assertEqual(entry[0], "action")
+        self.assertTrue(entry[1].startswith("[10:10:26 +12.4s] "), entry)
+        self.assertIn("第 1 步：#3366cc 硬笔画了 (100,100)→(900,900)", entry[1])
+        # 失败行与结束行同样带时间戳
+        bad = describe_call("pick_tools", {}, {"ok": False, "error": "Invalid"},
+                            0, ts="2026-09-13T10:10:31.123", elapsed_ms=17400)
+        self.assertTrue(bad[1].startswith("[10:10:31 +17.4s] "), bad)
+        self.assertIn("选择工具 执行失败", bad[1])
+        end = describe_call("finish", {}, {"ok": True, "summary": "一只猫"}, 2,
+                            ts="2026-09-13T10:12:39.900", elapsed_ms=225300)
+        self.assertEqual(end[0], "end")
+        self.assertTrue(end[1].startswith("[10:12:39 +3:45.3] "), end)
+        # 不给时间时不加前缀(纯文字日志场景)
+        self.assertFalse(describe_call("undo", {}, {"ok": True}, 1)[1]
+                         .startswith("["))
+
+
 class TestPidAlive(unittest.TestCase):
     def test_self_alive(self):
         self.assertTrue(pid_alive(os.getpid()))
@@ -139,6 +189,72 @@ class TestSessionLog(unittest.TestCase):
                 encoding="utf-8").strip().splitlines()
             self.assertEqual(len(lines), 4)  # init + 2 calls + terminated
 
+    def test_timestamps_and_duration(self):
+        """每条记录带墙钟时间戳与用时; 导出带总时长。"""
+        import tempfile
+        from datetime import datetime
+        from draw_app import SessionLog
+        with tempfile.TemporaryDirectory() as td:
+            log = SessionLog(td, {"width": 100, "height": 80,
+                                  "background_color": "#ffffff"})
+            log.log_call("use_tool", {"mode": "point", "x": 1},
+                         {"ok": True}, duration_ms=42)
+            log.log_call("undo", {}, {"ok": True}, duration_ms=3)
+            log.log_terminated("finished", "done")
+
+            self.assertEqual(len(log.records), 2)
+            for rec in log.records:
+                self.assertIn("ts", rec)
+                self.assertIsInstance(rec["elapsed_ms"], int)
+                self.assertGreaterEqual(rec["elapsed_ms"], 0)
+                datetime.fromisoformat(rec["ts"])   # 可解析
+            self.assertEqual(log.records[0]["duration_ms"], 42)
+            self.assertEqual(log.records[1]["duration_ms"], 3)
+
+            # jsonl 里连结束标记也带时间戳
+            lines = [json.loads(x) for x in
+                     (Path(td) / "session.jsonl").read_text(
+                         encoding="utf-8").strip().splitlines()]
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[0]["ts"], log.started_at)  # init = 会话起点
+            self.assertEqual(lines[-1]["type"], "terminated")
+            self.assertIn("elapsed_ms", lines[-1])
+
+            timing = log.timing()
+            self.assertEqual(timing["calls"], 2)
+            self.assertEqual(timing["started_at"], log.started_at)
+            self.assertEqual(timing["ended_at"], log.ended_at)
+            self.assertIsInstance(timing["total_ms"], int)
+            self.assertTrue(timing["total_text"].endswith("秒"))
+
+            out = Path(td) / "proc.json"
+            log.write_process(out, status="finished", text="done")
+            data = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(data["started_at"], log.started_at)
+            self.assertEqual(data["ended_at"], log.ended_at)
+            self.assertEqual(data["duration_ms"], timing["total_ms"])
+            self.assertEqual(data["duration_text"], timing["total_text"])
+
+    def test_old_records_without_timestamps_still_load(self):
+        """旧过程文件(无时间字段)也要能读: 时长汇总降级为空。"""
+        import tempfile
+        from replay import _recorded_span
+        with tempfile.TemporaryDirectory():
+            self.assertEqual(_recorded_span({"calls": []}), (None, None, None))
+            self.assertEqual(_recorded_span({}), (None, None, None))
+            # 只有 ts: 用最后一条 ts 与第一条 ts 的差
+            data = {"calls": [{"ts": "2026-09-13T10:00:00.000"},
+                              {"ts": "2026-09-13T10:00:05.500"}]}
+            self.assertEqual(_recorded_span(data)[2], 5500)
+            # 有 elapsed_ms: 直接用最后一条的用时
+            data = {"calls": [{"elapsed_ms": 100}, {"elapsed_ms": 2500}]}
+            self.assertEqual(_recorded_span(data)[2], 2500)
+            # 新格式: 字段优先
+            data = {"started_at": "A", "ended_at": "B", "duration_ms": 999,
+                    "calls": [{"elapsed_ms": 1}]}
+            self.assertEqual(_recorded_span(data),
+                             ("A", "B", 999))
+
 
 class TestHeadlessEndToEnd(unittest.TestCase):
     """draw_app --no-viewer + draw_cli 全流程。"""
@@ -229,20 +345,37 @@ class TestHeadlessEndToEnd(unittest.TestCase):
         self.assertIn("drawing", png.name)
         self.assertEqual(png.stat().st_size > 0, True)
 
+        # 结束结果里带总时长汇总(模型也能看到这次画了多久)
+        timing = r["timing"]
+        self.assertIsInstance(timing["calls"], int)
+        self.assertIsInstance(timing["total_ms"], int)
+        self.assertIn("秒", timing["total_text"])
+
         data = json.loads(proc_json.read_text(encoding="utf-8"))
         self.assertEqual(data["status"], "finished")
         self.assertEqual(data["text"], "测试画作")
+        self.assertEqual(data["duration_ms"], timing["total_ms"])
+        self.assertEqual(timing["calls"], len(data["calls"]))
         tools = [c["tool"] for c in data["calls"]]
         self.assertIn("use_tool", tools)
         self.assertNotIn("base64_image",
                          json.dumps(data["calls"]))
+        # 每条调用记录都带时间戳与用时(墙钟 + 距会话起点)
+        for c in data["calls"]:
+            self.assertIn("ts", c)
+            self.assertIsInstance(c["elapsed_ms"], int)
+            self.assertIsInstance(c["duration_ms"], int)
 
         # replay: 重放结果应与导出的最终图片逐像素一致
         rp = subprocess.run(
             [PY, "-X", "utf8", str(ROOT / "replay.py"), str(proc_json),
-             "--out", str(self.tmp / "replay.png")],
+             "--verbose", "--out", str(self.tmp / "replay.png")],
             capture_output=True, text=True, encoding="utf-8", timeout=120)
         self.assertEqual(rp.returncode, 0, rp.stdout + rp.stderr)
+        # 逐条轨迹带时间戳, 末尾汇总记录时长与重放用时
+        self.assertRegex(rp.stdout, r"\[\d{2}:\d{2}:\d{2} \+\d")
+        self.assertIn("记录时长", rp.stdout)
+        self.assertIn("重放用时", rp.stdout)
         from PIL import Image, ImageChops
         a = Image.open(png).convert("RGB")
         b = Image.open(self.tmp / "replay.png").convert("RGB")
@@ -452,10 +585,76 @@ class TestViewerPanels(unittest.TestCase):
         self._call("pick_tools", {"tool": "pen"})
         self._call("use_tool", {"mode": "point", "x": 100, "y": 100})
         self._call("finish", {"summary": "一只猫"})
+        ends = [t for k, t in self.app.history_entries if k == "end"]
+        self.assertTrue(ends, self.app.history_entries)
+        self.assertIn("完成本次绘画", ends[-1])
+        self.assertIn("一只猫", ends[-1])
+        # 结束行之后还有一行总时长汇总
         last_kind, last_text = self.app.history_entries[-1]
-        self.assertEqual(last_kind, "end")
-        self.assertIn("完成本次绘画", last_text)
-        self.assertIn("一只猫", last_text)
+        self.assertEqual(last_kind, "info")
+        self.assertTrue(last_text.startswith("总时长 "), last_text)
+        self.assertIn("次工具调用", last_text)
+        self.assertIn("（", last_text)   # 带 起点 → 终点 时间
+
+    def test_history_lines_carry_timestamps(self):
+        """右栏每行都以 [墙钟时间 +用时] 开头, 且与记录里的时间一致。"""
+        import re
+        self._call("pick_tools", {"tool": "pen",
+                                  "settings": {"color": "#3366cc"}})
+        self._call("use_tool", {"mode": "path",
+                                "path": {"points": [[100, 100],
+                                                    [900, 900]]}})
+        pattern = re.compile(r"^\[\d{2}:\d{2}:\d{2} \+\d+\.\d+s\] ")
+        for _, text in self.app.history_entries:
+            self.assertRegex(text, pattern, text)
+        # 记录里的时间戳与右栏展示的是同一个时刻(一次采样, 两处一致)
+        rec = self.app.log.records[-1]
+        from draw_app import format_timeline
+        self.assertTrue(
+            self.app.history_entries[-1][1].startswith(
+                format_timeline(rec["ts"], rec["elapsed_ms"])), rec)
+
+    def test_every_result_carries_timestamp(self):
+        """每次工具调用的结果都带 ts / elapsed_ms / duration_ms。"""
+        from datetime import datetime
+        for tool, args in (("pick_tools", {"tool": "pen"}),
+                           ("use_tool", {"mode": "point", "x": 10, "y": 10}),
+                           ("get_canvas_info", {})):
+            res = self._call(tool, args)
+            self.assertIn("ts", res, res)
+            datetime.fromisoformat(res["ts"])
+            self.assertIsInstance(res["elapsed_ms"], int)
+            self.assertIsInstance(res["duration_ms"], int)
+            self.assertGreaterEqual(res["duration_ms"], 0)
+            self.assertTrue(res["elapsed_text"].endswith("秒"))
+
+    def test_panel_and_ping_show_time(self):
+        self._call("pick_tools", {"tool": "pen"})
+        text = "\n".join(self.app.current_tool_lines())
+        self.assertIn("用时：", text)
+        self.assertIn("秒", text)
+        self.assertIn("用时", self.app._tool_html())
+        resp, _ = self.app.handle_request({"command": "ping"})
+        self.assertIn("started_at", resp)
+        self.assertIn("elapsed_ms", resp)
+        self.assertTrue(resp["elapsed_text"].endswith("秒"))
+
+    def test_finish_result_has_timing_summary(self):
+        self._call("pick_tools", {"tool": "pen"})
+        self._call("use_tool", {"mode": "point", "x": 100, "y": 100})
+        res = self._call("finish", {"summary": "计时"})
+        timing = res["timing"]
+        self.assertEqual(timing["calls"], 3)     # 3 次调用(pick/draw/finish)
+        self.assertIsInstance(timing["total_ms"], int)
+        self.assertTrue(timing["total_text"].endswith("秒"))
+        self.assertEqual(res["exported"]["timing"]["total_ms"],
+                         timing["total_ms"])
+        # 过程 JSON 里也记着同一份时长
+        data = json.loads(Path(res["exported"]["process"]).read_text(
+            encoding="utf-8"))
+        self.assertEqual(data["duration_ms"], timing["total_ms"])
+        self.assertEqual(data["started_at"], timing["started_at"])
+        self.assertEqual(data["duration_text"], timing["total_text"])
 
 
 class TestViewerWindowLayout(unittest.TestCase):
@@ -496,14 +695,18 @@ class TestViewerWindowLayout(unittest.TestCase):
         self.assertIn("硬笔", left)
         self.assertIn("粗细 24", left)
         self.assertIn("画布 800 × 600", left)
+        self.assertIn("用时", left)          # 左栏显示用时
         # 中栏: 画布已渲染出像素
         self.assertFalse(canvas_view.pixmap().isNull())
-        # 右栏: 历史记录为自然语言
+        # 右栏: 历史记录为自然语言, 每行带时间戳前缀
         right = history_view.toPlainText()
         self.assertIn("选好工具：硬笔", right)
         self.assertIn("第 1 步", right)
         self.assertIn("看了一眼当前画面", right)
         self.assertNotIn("{", right)      # 不是原始 JSON
+        import re
+        for line in [x for x in right.splitlines() if x.strip()]:
+            self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2} \+\d+\.\d+s\] ", right)
         win.close()
 
 

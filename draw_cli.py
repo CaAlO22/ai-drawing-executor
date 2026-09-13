@@ -21,6 +21,10 @@
 会话数据放在 <当前目录>/.ai-draw-session/(mailbox/req.json + resp.json 双槽
 通信、session.jsonl 日志、observe-*.png 观察图); 同一目录同时只有一个会话,
 且**全程不删除任何文件**(旧会话残留请求靠会话 token 自动失效)。
+
+时间戳: 每次工具调用的返回里都带 ts(墙钟, 毫秒精度) / elapsed_ms(距会话
+开始的用时) / elapsed_text / duration_ms(本次调用耗时), finish 另有 timing
+总时长汇总; 观察窗与 replay.py 的每条历史/轨迹也都带时间戳与总时长。
 """
 import argparse
 import json
