@@ -19,6 +19,8 @@ out/
 # finish 命令导出的成图与过程记录（若导出到仓库根目录）
 drawing-*.png
 drawing-process-*.json
+# selfcheck.py 的自检产物
+skill_selfcheck.png
 
 # ===== Python 缓存与虚拟环境 =====
 __pycache__/
